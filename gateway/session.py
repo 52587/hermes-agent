@@ -219,6 +219,10 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Local-only routing signal, resolved from the persisted automation binding.
+    # Never accept it from the wire: one automation thread is one conversation.
+    automation_thread: bool = False
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -1063,7 +1067,7 @@ def is_shared_multi_user_session(
     if source.chat_type == "dm":
         return False
     if source.thread_id:
-        return not thread_sessions_per_user
+        return source.automation_thread or not thread_sessions_per_user
     return not group_sessions_per_user
 
 
@@ -1202,7 +1206,7 @@ def build_session_key(
     # conversation).  Per-user isolation only applies when explicitly enabled
     # via thread_sessions_per_user, or when there is no thread (regular group).
     isolate_user = group_sessions_per_user
-    if effective_thread_id and not thread_sessions_per_user:
+    if effective_thread_id and (source.automation_thread or not thread_sessions_per_user):
         isolate_user = False
 
     if isolate_user and participant_id:
@@ -2115,6 +2119,16 @@ class SessionStore:
             had_activity = bool(row.get("message_count") or 0) or (
                 last_activity is not None
             )
+        metadata = {}
+        # Agent shutdown/compression rebuilds SessionEntry from the session
+        # row. Keep the run binding stored in the routing index, including
+        # its no-expiry policy, when recovering that same conversation.
+        if source.platform == Platform.DISCORD and source.thread_id and self._db:
+            saved = self._db.load_gateway_routing_entries(scope=self._routing_scope()).get(session_key)
+            if saved:
+                previous = SessionEntry.from_dict(json.loads(saved))
+                if self._compression_tip_for_session_id(previous.session_id) == str(row["id"]):
+                    metadata = previous.metadata
         return SessionEntry(
             session_key=session_key,
             session_id=str(row["id"]),
@@ -2125,6 +2139,7 @@ class SessionStore:
             platform=source.platform,
             chat_type=source.chat_type,
             reset_had_activity=bool(had_activity),
+            metadata=metadata,
         )
 
     def _find_gateway_session_row(
@@ -2411,6 +2426,8 @@ class SessionStore:
         Used by the background expiry watcher to proactively flush memories.
         Sessions with active background processes are never considered expired.
         """
+        if entry.metadata.get("automation_run"):
+            return False
         if self._has_active_processes_safe(entry.session_key, context="expiry"):
             logger.debug(
                 "Session %s not expired — active background processes",
@@ -2467,6 +2484,8 @@ class SessionStore:
         resolving the policy are treated as "not finalizable" (safe: the idle
         sweep falls back to reaping the agent rather than pinning it).
         """
+        if entry.metadata.get("automation_run"):
+            return False
         try:
             policy = self.config.get_reset_policy(
                 platform=entry.platform,
@@ -2511,6 +2530,8 @@ class SessionStore:
         
         Sessions with active background processes are never reset.
         """
+        if entry.metadata.get("automation_run"):
+            return None
         session_key = self._generate_session_key(source)
         if self._has_active_processes_safe(session_key, context="reset"):
             logger.debug(
@@ -3071,6 +3092,25 @@ class SessionStore:
             if entry is None:
                 return default
             return entry.metadata.get(key, default)
+
+    def get_automation_thread(self, thread_id: str) -> Optional[SessionEntry]:
+        """Resolve a Discord run through the existing durable routing index."""
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id=str(thread_id),
+            thread_id=str(thread_id), chat_type="thread", automation_thread=True,
+        )
+        entry = self.lookup_by_session_key(self._generate_session_key(source))
+        if entry is None and self._db:
+            # A standalone cron process can publish a route after this
+            # gateway loaded its in-memory index.
+            key = self._generate_session_key(source)
+            saved = self._db.load_gateway_routing_entries(scope=self._routing_scope()).get(key)
+            if saved:
+                candidate = SessionEntry.from_dict(json.loads(saved))
+                if candidate.metadata.get("automation_run"):
+                    with self._lock:
+                        entry = self._entries.setdefault(key, candidate)
+        return entry if entry and entry.metadata.get("automation_run") else None
 
     def set_session_metadata(
         self,

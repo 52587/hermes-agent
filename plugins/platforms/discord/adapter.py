@@ -2691,8 +2691,10 @@ class DiscordAdapter(BasePlatformAdapter):
             free_channels = self._discord_free_response_channels()
             in_bot_thread = (
                 isinstance(message.channel, discord.Thread)
-                and str(message.channel.id) in self._threads
-                and not self._discord_thread_require_mention()
+                and (await self._is_automation_thread(str(message.channel.id)) or (
+                    str(message.channel.id) in self._threads
+                    and not self._discord_thread_require_mention()
+                ))
             )
             if (
                 self._discord_require_mention()
@@ -8094,6 +8096,14 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
 
+    async def _is_automation_thread(self, thread_id: Optional[str]) -> bool:
+        store = getattr(self, "_session_store", None)
+        if not thread_id or store is None:
+            return False
+        from gateway.session import SessionEntry
+        entry = await asyncio.to_thread(store.get_automation_thread, thread_id)
+        return isinstance(entry, SessionEntry)
+
     async def _handle_message(
         self,
         message: DiscordMessage,
@@ -8120,6 +8130,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if is_thread:
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
+
+        automation_thread = await self._is_automation_thread(thread_id)
 
         is_voice_linked_channel = False
 
@@ -8184,9 +8196,11 @@ class DiscordAdapter(BasePlatformAdapter):
             # are gated the same as channels.  Useful when multiple bots share
             # a thread.
             in_bot_thread = (
-                is_thread
-                and thread_id in self._threads
-                and not self._discord_thread_require_mention()
+                automation_thread or (
+                    is_thread
+                    and thread_id in self._threads
+                    and not self._discord_thread_require_mention()
+                )
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
@@ -8320,6 +8334,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 or self._derive_auto_thread_name(message.content or "")
             ) if auto_threaded_channel is not None else None,
         )
+
+        source.automation_thread = automation_thread
 
         # Build media URLs -- download image attachments to local cache so the
         # vision tool can access them reliably (Discord CDN URLs can expire).

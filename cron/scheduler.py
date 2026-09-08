@@ -3140,6 +3140,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
+    # Direct delivery callers also need a stable identity for this invocation.
+    job = dict(job)
+    job.setdefault("execution_id", uuid.uuid4().hex)
+
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
@@ -3473,8 +3477,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # the row first (F5).
         thread_seeded = False
         opened_thread_id: Optional[str] = None
+        discord_run_thread = False
+        if platform == Platform.DISCORD and not (transport and transport.is_relay):
+            from cron.discord_threads import prepare_run_thread
+
+            coro = prepare_run_thread(
+                job, config, pconfig, str(thread_id or chat_id), mirror_text,
+                runtime_adapter if live_adapter_ready else None,
+            )
+            try:
+                if live_adapter_ready:
+                    from agent.async_utils import safe_schedule_threadsafe
+                    future = safe_schedule_threadsafe(coro, loop)
+                    if future is None:
+                        raise RuntimeError("Discord gateway loop is unavailable")
+                    try:
+                        run_thread_id = future.result(timeout=60)
+                    except concurrent.futures.TimeoutError:
+                        future.cancel()
+                        raise
+                else:
+                    run_thread_id = asyncio.run(coro)
+                if run_thread_id:
+                    thread_id = run_thread_id
+                    discord_run_thread = thread_seeded = True
+                    in_channel_surface = False
+                    mirror_this_target = False
+            except Exception as exc:
+                coro.close()
+                delivery_errors.append(f"Discord automation thread preparation failed: {exc}")
+                # Never dump this run into the shared channel after a failure.
+                continue
         if (
             mirror_this_target
+            and not discord_run_thread
             and not in_channel_surface
             and runtime_adapter is not None
             and loop is not None
@@ -5820,7 +5856,8 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = f"cron_{job_id}_{job.get('execution_id') or uuid.uuid4().hex}"
+    job["_cron_session_id"] = _cron_session_id
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -7263,6 +7300,8 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    # Run-local metadata must not leak back into the persisted job definition.
+    job = dict(job, execution_id=execution_id)
     delivery_attempted = False
     delivery_error = None
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
@@ -7514,6 +7553,7 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
+                        job["_delivery_status"] = "Completed" if success else "Needs attention"
                         delivery_error = _deliver_result(
                             job,
                             deliver_content,
@@ -7672,6 +7712,7 @@ def _run_one_job_body(
             else:
                 try:
                     delivery_attempted = True
+                    job["_delivery_status"] = "Needs attention"
                     delivery_error = _deliver_result(
                         job,
                         # Composed exactly like the normal failure delivery above.

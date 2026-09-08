@@ -498,6 +498,7 @@ class TestDeliverResultWrapping:
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.discord_threads.prepare_run_thread", new=AsyncMock(return_value="run-thread")), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
             _deliver_result(
                 job,
@@ -516,6 +517,8 @@ class TestDeliverResultWrapping:
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
+        assert adapter.send.call_args.kwargs["metadata"]["thread_id"] == "run-thread"
+        assert voice_call.kwargs["metadata"]["thread_id"] == "run-thread"
 
 
 class TestDeliverResultErrorReturns:

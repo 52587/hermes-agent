@@ -782,6 +782,28 @@ Notes:
 - When `voice_fx.enabled` is `false`, voice playback uses the original one-shot path and nothing changes.
 
 
+## Automation run threads
+
+Cron notifications sent by the native Discord Bot to a text or announcement
+channel now create one public thread per run. The channel receives a short
+completion or attention summary; details, attachments, and follow-up replies
+stay in the thread. Existing thread destinations create the new run's thread
+under their parent channel. The existing Bot token and delivery channel are reused.
+
+The gateway's existing `state.db` routing index stores the thread's session ID
+and `automation_run` metadata (job ID, execution ID, source session ID). Each
+thread starts with a snapshot of that run's conversation, or its prompt and
+output for script-only jobs. Replies resume this context after a restart,
+without requiring an @mention. Automatic daily/idle resets do not clear these
+run conversations; explicit `/new` still starts a fresh conversation.
+
+This does not require `cron.mirror_delivery` or `attach_to_session`. Creating
+the thread requires the Bot's Create Public Threads permission; replying
+requires Send Messages in Threads. Preparation failures are reported as delivery
+errors, without spilling the detailed output into the parent channel. DMs
+and relay transports retain their existing behavior. For automation delivery,
+use a text or announcement channel rather than a forum parent.
+
 ## Forum Channels
 
 Discord forum channels (type 15) don't accept direct messages — every post in a forum must be a thread. Hermes auto-detects forum channels and creates a new thread post whenever it needs to send there, so text replies, TTS, images, voice messages, and file attachments all work without special handling from the agent.
@@ -927,5 +949,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 
