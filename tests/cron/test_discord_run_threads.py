@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -198,3 +199,51 @@ async def test_standalone_uses_existing_token_and_publishes_resumable_route(setu
     entry = store.get_automation_thread(thread_id)
     assert entry.metadata["automation_run"]["run_id"] == "script-run"
     assert "Script report" in str(store.load_transcript(entry.session_id))
+
+
+@pytest.mark.asyncio
+async def test_multiplex_bots_only_resume_their_own_run_context(setup, tmp_path, monkeypatch):
+    from gateway.run import _profile_runtime_scope
+
+    config, pconfig, store, adapter, _ = setup
+    config.multiplex_profiles = True
+    monkeypatch.setattr(Path, "home", lambda: tmp_path.parent)
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "profiles")
+    routes = {}
+    for profile, detail in [("silverwolf", "Third issue: parser"), ("herta", "Third topic: whales")]:
+        home = tmp_path / "profiles" / profile
+        home.mkdir(parents=True)
+        (home / ".env").write_text("")
+        with _profile_runtime_scope(home):
+            adapter.set_owner_profile(profile)
+            store._db.create_session(profile, source="cron")
+            store._db.replace_messages(profile, [
+                {"role": "user", "content": "Keep this run's private working notes"},
+                {"role": "assistant", "content": detail},
+            ])
+            thread_id = await prepare_run_thread(
+                {"id": profile, "execution_id": profile, "_cron_session_id": profile},
+                config, pconfig, "100", "Completed", adapter,
+            )
+            entry = store.get_automation_thread(thread_id)
+            routes[profile] = (thread_id, entry.session_id)
+
+    # Each bot uses the same gateway SessionStore, but its own profile DB and
+    # routing namespace. Reconstruct the store to exercise restart recovery.
+    restarted = SessionStore(tmp_path / "sessions", config)
+    for profile, (thread_id, conversation_id) in routes.items():
+        with _profile_runtime_scope(tmp_path / "profiles" / profile):
+            adapter.set_owner_profile(profile)
+            adapter.set_session_store(restarted)
+            assert await adapter._is_automation_thread(thread_id)
+            other_thread = next(t for p, (t, _) in routes.items() if p != profile)
+            assert not await adapter._is_automation_thread(other_thread)
+            source = SessionSource(platform=Platform.DISCORD, chat_id=thread_id,
+                thread_id=thread_id, chat_type="thread", profile=profile,
+                user_id="42", automation_thread=True)
+            entry = restarted.get_or_create_session(source)
+            assert entry.session_id == conversation_id
+            transcript = str(restarted.load_transcript(entry.session_id))
+            assert ("parser" in transcript) == (profile == "silverwolf")
+            assert ("whales" in transcript) == (profile == "herta")
