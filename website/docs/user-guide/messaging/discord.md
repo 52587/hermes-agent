@@ -380,6 +380,40 @@ discord:
   thread_require_mention: true    # multi-bot setup
 ```
 
+#### `discord.thread_owner_routing`
+
+**Type:** boolean — **Default:** `false`
+
+For multiple Discord Bots served by one multiplex gateway, enable this on every
+participating profile to route human Thread messages to one owner:
+
+```yaml
+discord:
+  require_mention: true
+  thread_require_mention: true
+  thread_owner_routing: true
+  history_backfill: true
+```
+
+Regular channels still require a mention. Inside a Thread, plain messages go to
+its owner, initially the Bot that created it. A literal `@Bot` in a human message
+transfers ownership to that connected Bot; subsequent plain messages follow it.
+If several team Bots are mentioned, the first in the message is selected. Reply
+notifications and Bot-generated task updates do not transfer ownership. A
+human-created Thread without an owner needs one explicit mention to establish it.
+
+Ownership is stored in the existing gateway routing database and survives
+restarts. Delayed recovery of an older mention cannot undo a newer handoff.
+User and channel allowlists still apply. Profile sessions remain separate;
+history backfill includes the connected team's messages from this Thread so the
+new owner can continue the discussion. This does not enable Bot-to-Bot triggers,
+copy private memory, or transfer already-running background tasks to another Bot.
+
+This option takes precedence over Thread mention/free-response shortcuts for
+human messages. If the owner is unavailable, explicitly mention another connected
+Bot. If the routing database is unavailable, the Thread is not dispatched rather
+than allowing multiple Bots to answer.
+
 #### `discord.free_response_channels`
 
 **Type:** string or list — **Default:** `""`
@@ -927,5 +961,3 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
-
