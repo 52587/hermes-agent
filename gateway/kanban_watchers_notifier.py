@@ -138,6 +138,42 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     return primary if profile == primary_profile else None
 
 
+def _discord_worker_update(conn, kb, task, event, sub):
+    """Public task events only; keep run identity and full summary together."""
+    if task is None:
+        return None
+    run = kb.get_run(conn, event.run_id) if event.run_id else None
+    profile = run.profile if run else task.assignee
+    payload = event.payload or {}
+    if event.kind == "claimed":
+        text = f"收到，这项任务我来处理。\n{task.title[:120]}"
+    elif event.kind == "commented":
+        row = conn.execute(
+            "SELECT author, body FROM task_comments WHERE id=? AND task_id=?",
+            (payload.get("comment_id"), task.id),
+        ).fetchone()
+        if not row or not row["body"].startswith("[progress] "):
+            return None
+        # Worker or coordinator may publish a concrete handoff note. Arbitrary
+        # authors cannot make another connected profile appear to speak here.
+        if row["author"] not in {profile, sub.get("notifier_profile")}:
+            return None
+        profile, text = row["author"], row["body"][11:]
+    elif event.kind in ("completed", "review_requested"):
+        summary = (run.summary if run else None) or payload.get("summary") or task.result or ""
+        label = "已完成，结果交回发起人" if event.kind == "completed" else "已提交复核"
+        text = f"{label}：{task.title[:120]}\n{summary}"
+    elif event.kind == "blocked":
+        text = f"这项任务需要确认：{task.title[:120]}\n{payload.get('reason') or ''}"
+    else:
+        return None
+    if not profile:
+        return None
+    from agent.redact import redact_sensitive_text
+    text = redact_sensitive_text(str(text)[:3500], force=True, redact_url_credentials=True)
+    return {"profile": profile, "text": f"{text.replace('@', '@' + chr(0x200b))}\n[{task.id}]"}
+
+
 # --- Collection (runs in a worker thread) ---
 
 
@@ -146,6 +182,8 @@ class _Collector:
 
     def __init__(self, runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool, gc_retention_days: int) -> None:
         self.runner = runner
+        from hermes_cli.config import load_config
+        self.discord_worker_updates = bool((load_config().get("kanban") or {}).get("discord_worker_updates", False))
         self.kb = kb
         self.notifier_profile = notifier_profile
         self.gc_due = gc_due
@@ -225,16 +263,20 @@ class _Collector:
         from gateway.config import Platform
         if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
             return None
+        worker_updates = self.discord_worker_updates and platform == "discord" and bool(sub.get("thread_id"))
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-            thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
+            thread_id=sub.get("thread_id") or "",
+            kinds=TERMINAL_KINDS + (("claimed", "commented") if worker_updates else ()),
         )
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug,
+                "worker_updates": {ev.id: _discord_worker_update(conn, self.kb, task, ev, sub)
+                                   for ev in events} if worker_updates else {}}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -445,7 +487,8 @@ class _KanbanNotification:
         """Render one event; accumulates wake handoff/review detail. None → silent kind."""
         formatter = _EVENT_FORMATTERS.get(ev.kind)
         if formatter is None:
-            return None
+            update = self.d.get("worker_updates", {}).get(ev.id)
+            return update["text"] if update else None
         msg, handoff, review_detail = formatter(ev, self)
         if handoff is not None:
             self.wake_handoff = handoff
@@ -525,6 +568,14 @@ class _KanbanNotification:
     async def _send_event(self, ev: Any, msg: str) -> None:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
         sub, adapter = self.sub, self.adapter
+        update = self.d.get("worker_updates", {}).get(ev.id)
+        if update:
+            worker_adapter = _adapter_for_subscription(self.runner, self.plat, sub, update["profile"])
+            if worker_adapter is not None:
+                adapter, msg = worker_adapter, update["text"]
+            else:
+                msg = f"[{update['profile']} · 代转]\n{update['text']}"
+        # self.adapter remains the original coordinator for completion wakes.
         delivery_metadata = sub.get("delivery_metadata")
         metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
