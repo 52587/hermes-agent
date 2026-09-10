@@ -4,6 +4,14 @@
 
 `roster.yaml` 保存七位角色的名字、背景摘要、性格、分工和语气示例；`TEAM.md` 保存协作规则。SOUL.md 由这些内容组合。分工和说话方式是为助手用途作出的演绎，不能当作官方剧情。
 
+人设更新以 `personality` 和 `voice_example` 为主：分别说明关注点、句子节奏、闲聊与工作表达、队友相处方式和容易失真的写法。每位角色都有同一闲聊问题的原创示例，以及信息不足和条件明确时的工作示例。例句中的成功、故障和共同经历都是假设，不能当成运行事实；禁止照抄例句或编造交接。普通闲聊先接话，不自动变成任务汇报；技术正确性和真实派单要求继续有效。
+
+更新已有 Profile 时，只替换 `SOUL.md` 中 `# Discord 星穹小队` 之前的角色段落，按原有字段组成背景、性格与表达、工作、原创语气示例。保留后面的实际团队规则及用户其他内容，并先备份。如果末尾仍重复旧默认身份 `You are Hermes Agent, built by Nous Research.`，将这一句改为运行框架说明，保留质量要求，避免与开头角色身份竞争。不要重跑初次安装、复制会话或更换 Token，也不要为了人设更新切换正在运行的代码分支。
+
+新会话会读取新 SOUL；旧会话的系统提示词保持缓存。需要在原 Thread 继续使用新语气时，可以正常发一条：“读取你当前 Profile 的 SOUL.md，后续按更新后的角色语气继续，保留本线程上下文。”不必清空对话，也不能靠重启承诺所有旧会话已经换了人设。加载机制参见 [Hermes 官方人格说明](https://hermes-agent.nousresearch.com/docs/user-guide/features/personality)。
+
+表达验收用同一组闲聊、证据不足和工作取舍问题，检查能否区分七人的关注点、是否自然、是否凭空声称已执行。模型试答只能作为样本，不能保证所有对话都保持相同辨识度；公开通知中的固定状态标题属于网关格式，不是角色自述。
+
 现有 Bot 对应 default（卡芙卡），另外六个 Profile 分别使用六个独立 Discord Application/Bot Token。各 Profile 自己保存模型配置、凭据、SOUL.md、记忆和 state.db。只复制模型配置和所需模型凭据，不复制已有会话、记忆、自动化任务或其他平台登录。
 
 所有 Profile 的 `gateway.multiplex_profiles` 设为 true，`gateway.multiplex_profile_allowlist` 指定这六个 Profile；仅从 default 启动 Gateway。Discord 使用 `require_mention: true`、`thread_require_mention: true`、`auto_thread: true`，继承原用户 allowlist。保持 `DISCORD_ALLOW_BOTS=none`，不靠 Bot 互相回复派单。自动化 Thread 的拥有者仍支持用户免 @ 继续该任务。
