@@ -745,3 +745,73 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_discord_worker_updates_keep_origin_wake_and_thread_isolation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    (tmp_path / "config.yaml").write_text("kanban:\n  discord_worker_updates: true\n")
+    kb.init_db()
+    origin, engineer, researcher = RecordingAdapter(), RecordingAdapter(), RecordingAdapter()
+    runner = _make_runner(origin)
+    runner.adapters = {Platform.DISCORD: origin}
+    runner._active_profile_name = lambda: "default"
+    runner._profile_adapters = {
+        "engineer": {Platform.DISCORD: engineer},
+        "researcher": {Platform.DISCORD: researcher},
+    }
+    conn = kb.connect()
+    try:
+        for profile, thread, marker in [("engineer", "thread-a", "alpha"), ("researcher", "thread-b", "beta")]:
+            tid = kb.create_task(conn, title=marker, assignee=profile)
+            kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id="parent",
+                              thread_id=thread, notifier_profile="default", delivery_mode="notify+wake")
+            assert kb.claim_task(conn, tid)
+            kb.add_comment(conn, tid, author=profile, body="internal notes must stay private")
+            kb.add_comment(conn, tid, author=profile, body=f"[progress] checked {marker} <@123456789012345678> @everyone")
+            kb.complete_task(conn, tid, summary=f"result {marker}\nsecond line evidence")
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert origin.sent == []
+    assert len(origin.handled) == 2
+    assert {e.source.thread_id for e in origin.handled} == {"thread-a", "thread-b"}
+    for adapter, thread, marker, other in [(engineer, "thread-a", "alpha", "beta"), (researcher, "thread-b", "beta", "alpha")]:
+        assert len(adapter.sent) == 3  # claimed, explicit progress, completed
+        assert adapter.handled == []  # only the coordinator wakes
+        assert all(m["metadata"]["thread_id"] == thread for m in adapter.sent)
+        joined = "\n".join(m["text"] for m in adapter.sent)
+        assert marker in joined and other not in joined
+        assert "internal notes" not in joined
+        assert "<@123456789012345678>" not in joined and "@everyone" not in joined
+        assert "second line evidence" in joined
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(engineer.sent) == len(researcher.sent) == 3  # persisted cursor prevents replay
+    assert len(origin.handled) == 2
+
+
+def test_discord_worker_updates_off_keeps_original_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy", assignee="engineer")
+        kb.add_notify_sub(conn, task_id=tid, platform="discord", chat_id="parent", thread_id="thread-a", notifier_profile="default")
+        assert kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="engineer", body="[progress] unpublished")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+    origin, worker = RecordingAdapter(), RecordingAdapter()
+    runner = _make_runner(origin)
+    runner.adapters = {Platform.DISCORD: origin}
+    runner._active_profile_name = lambda: "default"
+    runner._profile_adapters = {"engineer": {Platform.DISCORD: worker}}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(origin.sent) == 1
+    assert worker.sent == []
+    assert "unpublished" not in origin.sent[0]["text"]

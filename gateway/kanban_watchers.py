@@ -33,6 +33,46 @@ _LOCAL_PATH_RE = re.compile(
 )
 
 
+def _discord_worker_update(conn, kb, task, event):
+    """Render only explicitly public updates from durable task events."""
+    if task is None:
+        return None
+    payload = event.payload or {}
+    run = kb.get_run(conn, event.run_id) if event.run_id else None
+    profile = run.profile if run else task.assignee
+    title = task.title[:120]
+    if event.kind == "claimed":
+        text = f"▶ Started — {title}"
+    elif event.kind == "commented":
+        # An event references its exact comment, not the latest comment on the
+        # board. Old events without an id and ordinary internal notes stay private.
+        row = conn.execute(
+            "SELECT author, body FROM task_comments WHERE id=? AND task_id=?",
+            (payload.get("comment_id"), task.id),
+        ).fetchone()
+        if not row or not row["body"].startswith("[progress] "):
+            return None
+        profile = row["author"]
+        text = f"{title}\n{row['body'][11:][:3500]}"
+    elif event.kind in ("completed", "review_requested"):
+        summary = (run.summary if run else None) or payload.get("summary") or task.result or ""
+        label = "Completed" if event.kind == "completed" else "Ready for review"
+        text = f"✔ {label} — {title}\n{str(summary)[:3500]}"
+    elif event.kind == "blocked":
+        text = f"⏸ Blocked — {title}\n{str(payload.get('reason') or '')[:3500]}"
+    else:
+        return None
+    if not profile:
+        return None
+    from agent.redact import redact_sensitive_text
+
+    text = redact_sensitive_text(text, force=True)
+    # Updates are presentation, never another Bot's work trigger. Keep even
+    # quoted mentions inert; completion wakes use the existing internal route.
+    text = text.replace("@", "@\u200b")
+    return {"profile": profile, "text": f"{text}\n[{task.id}]"}
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
     from agent.redact import redact_sensitive_text
@@ -264,6 +304,11 @@ class GatewayKanbanWatchersMixin:
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        from hermes_cli.config import load_config
+
+        discord_worker_updates = bool(
+            (load_config().get("kanban") or {}).get("discord_worker_updates", False)
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -478,13 +523,18 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
+                                    worker_updates = (
+                                        discord_worker_updates
+                                        and platform == "discord"
+                                        and bool(sub.get("thread_id"))
+                                    )
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=TERMINAL_KINDS + (("claimed", "commented") if worker_updates else ()),
                                     )
                                     if not events:
                                         continue
@@ -500,6 +550,10 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "worker_updates": {
+                                            ev.id: _discord_worker_update(conn, _kb, task, ev)
+                                            for ev in events
+                                        } if worker_updates else {},
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -573,6 +627,7 @@ class GatewayKanbanWatchersMixin:
                     wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        worker_update = d.get("worker_updates", {}).get(ev.id)
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -687,6 +742,8 @@ class GatewayKanbanWatchersMixin:
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
+                        elif kind in ("claimed", "commented") and worker_update:
+                            msg = worker_update["text"]
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -740,7 +797,19 @@ class GatewayKanbanWatchersMixin:
                             # outcome there, not by skipping the send here.
                             continue
                         try:
-                            _send_res = await adapter.send(
+                            delivery_adapter = adapter
+                            if worker_update:
+                                worker_adapter = self._authorization_adapter(
+                                    plat, worker_update["profile"],
+                                )
+                                if worker_adapter is not None:
+                                    delivery_adapter = worker_adapter
+                                    msg = worker_update["text"]
+                                else:
+                                    # Do not impersonate an unavailable worker.
+                                    # Keep the result visible and wake the owner.
+                                    msg = f"[{worker_update['profile']} · relayed]\n{worker_update['text']}"
+                            _send_res = await delivery_adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
                             # A SendResult(success=False) without an exception
@@ -771,7 +840,7 @@ class GatewayKanbanWatchersMixin:
                             if kind == "completed":
                                 try:
                                     await self._deliver_kanban_artifacts(
-                                        adapter=adapter,
+                                        adapter=delivery_adapter,
                                         chat_id=sub["chat_id"],
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
