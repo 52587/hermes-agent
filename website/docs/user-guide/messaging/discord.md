@@ -414,6 +414,31 @@ human messages. If the owner is unavailable, explicitly mention another connecte
 Bot. If the routing database is unavailable, the Thread is not dispatched rather
 than allowing multiple Bots to answer.
 
+#### Visible worker handoffs in a task Thread
+
+For a multiplex team using native Kanban, set
+`kanban.discord_worker_updates: true` in the coordinator's configuration.
+Keep Bot-to-Bot triggers disabled. A real task claim produces a receipt from the
+assigned worker's Bot in the originating Thread. Public comments beginning with
+`[progress] `, full completion summaries (up to 3,500 characters), review requests
+and blockers also use that role's Bot. If it is unavailable, the coordinator
+visibly relays the message. Ordinary comments remain internal.
+
+The coordinator should announce a successful assignment, then wait for the native
+`notify+wake` subscription. The worker should publish its concrete plan or first
+finding with `kanban_comment`, and further public comments only for meaningful
+findings, questions or changed plans. Both the worker and originating coordinator
+can author public handoff comments. These should read like brief messages to each
+other, grounded in actual task state; do not invent a dialogue or send duplicate
+messages directly to Discord.
+
+Only terminal events wake the originating coordinator, which reads the actual
+task result and gives the user the final report. Worker receipts and progress do
+not change the Thread's conversational owner or wake the coordinator repeatedly.
+The existing persistent event checkpoints and retry handling remain responsible
+for delivery. This display option is off by default and applies only to Discord
+subscriptions with a Thread ID.
+
 #### `discord.free_response_channels`
 
 **Type:** string or list — **Default:** `""`

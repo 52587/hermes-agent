@@ -748,3 +748,87 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_discord_worker_handoffs_keep_coordinator_wakes_and_private_notes(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
+    (tmp_path / 'config.yaml').write_text('kanban:\n  discord_worker_updates: true\n')
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    kb.init_db()
+    origin, engineer, researcher = RecordingAdapter(), RecordingAdapter(), RecordingAdapter()
+    runner = _make_runner(origin)
+    runner.config = SimpleNamespace(multiplex_profiles=True, profile_routes=[])
+    runner.adapters = {Platform.DISCORD: origin}
+    runner._active_profile_name = lambda: 'default'
+    runner._primary_profile_name = 'default'
+    runner._profile_adapters = {'engineer': {Platform.DISCORD: engineer},
+                                'researcher': {Platform.DISCORD: researcher}}
+    conn = kbc.connect()
+    ids = []
+    try:
+        for profile, thread, marker in [('engineer', 'thread-a', 'alpha'), ('researcher', 'thread-b', 'beta')]:
+            tid = kb.create_task(conn, title=marker, assignee=profile)
+            ids.append(tid)
+            kbn.add_notify_sub(conn, task_id=tid, platform='discord', chat_id='parent',
+                               thread_id=thread, notifier_profile='default', delivery_mode='notify+wake')
+            assert kb.claim_task(conn, tid)
+            kb.add_comment(conn, tid, author=profile, body='private internal note')
+            kb.add_comment(conn, tid, author=profile, body=f'[progress] checked {marker} <@123456789012345678>')
+            kb.add_comment(conn, tid, author='outsider', body='[progress] impersonation')
+        kb.add_comment(conn, ids[0], author='default', body='[progress] please verify the last condition')
+    finally:
+        conn.close()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(origin.sent) == 1  # the coordinator's explicit public comment
+    assert origin.handled == []  # receipt/progress do not wake the coordinator
+    assert len(engineer.sent) == len(researcher.sent) == 2
+    for adapter, thread, marker, other in [(engineer, 'thread-a', 'alpha', 'beta'),
+                                          (researcher, 'thread-b', 'beta', 'alpha')]:
+        assert all(m['metadata']['thread_id'] == thread for m in adapter.sent)
+        text = '\n'.join(m['text'] for m in adapter.sent)
+        assert marker in text and other not in text
+        assert 'private internal' not in text and 'impersonation' not in text
+        assert '<@123456789012345678>' not in text
+
+    conn = kbc.connect()
+    try:
+        for tid in ids:
+            kb.complete_task(conn, tid, summary='conclusion\nfull second-line evidence')
+    finally:
+        conn.close()
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(engineer.sent) == len(researcher.sent) == 3
+    assert all('full second-line evidence' in a.sent[-1]['text'] for a in (engineer, researcher))
+    assert len(origin.handled) == 2
+    assert {e.source.thread_id for e in origin.handled} == {'thread-a', 'thread-b'}
+    assert not engineer.handled and not researcher.handled
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(engineer.sent) == len(researcher.sent) == 3
+    assert len(origin.handled) == 2
+
+
+def test_discord_worker_updates_default_off_preserves_origin_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title='legacy', assignee='worker')
+        kbn.add_notify_sub(conn, task_id=tid, platform='discord', chat_id='parent',
+                           thread_id='thread-a', notifier_profile='default')
+        kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author='worker', body='[progress] not public with option off')
+        kb.complete_task(conn, tid, summary='done')
+    finally:
+        conn.close()
+    origin = RecordingAdapter()
+    runner = _make_runner(origin)
+    runner.adapters = {Platform.DISCORD: origin}
+    runner._active_profile_name = lambda: 'default'
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(origin.sent) == 1
+    assert 'not public' not in origin.sent[0]['text']
