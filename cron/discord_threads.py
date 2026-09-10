@@ -98,7 +98,15 @@ async def prepare_run_thread(job, config, pconfig, chat_id, content, adapter=Non
             async def request(method, path, payload=None):
                 if client:
                     from discord.http import Route
-                    return await client.http.request(Route(method, path), json=payload)
+                    # discord.py turns ANY ``json=`` kwarg into a request body —
+                    # including ``json=None``, which serialises to a literal
+                    # "null" and makes bodied GETs. Discord's edge intermittently
+                    # rejects those with 400/502 Cloudflare pages ("malformed or
+                    # illegal request"), which broke every run-thread preparation
+                    # attempt from 2026-09-09 onward. Omit the kwarg entirely when
+                    # there is no payload so GETs stay strictly body-less.
+                    extra = {"json": payload} if payload is not None else {}
+                    return await client.http.request(Route(method, path), **extra)
                 async with http.request(
                     method, f"https://discord.com/api/v10{path}",
                     headers={"Authorization": f"Bot {token}"},
