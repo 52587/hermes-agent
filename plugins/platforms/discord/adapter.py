@@ -2193,7 +2193,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             adapters.extend(group.values())
         return {
             str(a._client.user.id): getattr(a, "_owner_profile", None) or "default"
-            for a in adapters if isinstance(a, DiscordAdapter)
+            for a in adapters if getattr(a, "platform", None) == Platform.DISCORD
             and getattr(a, "_client", None) and getattr(a._client, "user", None)
         }
 

@@ -52,7 +52,10 @@ def team(tmp_path, monkeypatch):
         a._ready_event.set()
         a._text_batch_delay_seconds = 0
         a.handle_message = AsyncMock()
-        runner._profile_adapters[profile] = {Platform.DISCORD: a}
+        # Profile-scoped plugin loading creates different DiscordAdapter classes.
+        # Discover teammates through the platform contract, not Python class identity.
+        runner._profile_adapters[profile] = {Platform.DISCORD: SimpleNamespace(
+            platform=a.platform, _client=a._client, _owner_profile=a._owner_profile)}
         agents.append(a)
     yield agents, runner
     db.close()
