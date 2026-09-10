@@ -1395,6 +1395,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 self._warn_if_fail_closed_default()
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+        if (
+            self._discord_thread_owner_routing()
+            and isinstance(message.channel, discord.Thread)
+            and not getattr(message.author, "bot", False)
+        ):
+            return self._route_owned_thread(message, claim=claim), role_authorized
         raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
@@ -2175,9 +2181,88 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             await self._finish_recovery_scan(scan_id, "failed", counts, error=str(exc))
             logger.warning("[%s] Missed-message backfill failed: %s", self.name, exc, exc_info=True)
 
+    def _discord_thread_owner_routing(self) -> bool:
+        return str(self.config.extra.get("thread_owner_routing", False)).lower() in {"true", "1", "yes"}
+
+    def _team_discord_bots(self) -> dict:
+        """Connected identities in this gateway; no credentials or cross-profile histories."""
+        runner = getattr(self, "gateway_runner", None)
+        adapters = [self]
+        adapters.extend(getattr(runner, "adapters", {}).values())
+        for group in getattr(runner, "_profile_adapters", {}).values():
+            adapters.extend(group.values())
+        return {
+            str(a._client.user.id): getattr(a, "_owner_profile", None) or "default"
+            for a in adapters if getattr(a, "platform", None) == Platform.DISCORD
+            and getattr(a, "_client", None) and getattr(a._client, "user", None)
+        }
+
+    def _route_owned_thread(self, message: Any, *, claim: bool = False) -> bool:
+        """One human message, one owner. Raw @ selects; reply-pings do not transfer ownership.
+
+        Use the gateway's pinned routing DB, not the ambient profile's state.db. A separate
+        scope survives the SessionStore's normal index rewrites. Snowflakes prevent delayed
+        recovery of an older mention from reverting a more recent handoff.
+        """
+        bots = self._team_discord_bots()
+        own_id = str(self._client.user.id)
+        targets = [bot for bot in re.findall(r"<@!?(\d+)>", message.content or "") if bot in bots]
+        target = targets[0] if targets else None
+        if target and target != own_id:
+            return False
+        if not target and any(
+            getattr(m, "bot", False) and str(m.id) not in bots
+            for m in getattr(message, "mentions", [])
+        ):
+            return False
+        keys = self._discord_channel_keys(message, self._get_parent_channel_id(message.channel))
+        allowed, ignored = self._get_allowed_channels(), self._get_ignored_channels()
+        if (allowed and "*" not in allowed and not keys & allowed) or "*" in ignored or keys & ignored:
+            return False
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "session_store", None)
+        db = getattr(store, "_routing_db", None)
+        if db is None:
+            return False
+        scope = "discord:thread-owner"
+        thread_id = str(message.channel.id)
+        creator = str(getattr(message.channel, "owner_id", ""))
+        initial = creator if creator in bots else None
+        try:
+            def resolve(conn):
+                row = conn.execute(
+                    "SELECT entry_json FROM gateway_routing WHERE scope=? AND session_key=?",
+                    (scope, thread_id),
+                ).fetchone()
+                entry = json.loads(row[0]) if row else {}
+                owner = entry.get("bot_id") or initial
+                if claim and (target or owner == own_id):
+                    mid = int(message.id)
+                    if not entry or (target and mid > int(entry.get("message_id", 0))):
+                        owner = target or owner
+                        data = json.dumps({"bot_id": owner, "profile": bots[owner], "message_id": str(mid)})
+                        conn.execute(
+                            "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+                            "VALUES (?, ?, ?, ?) ON CONFLICT(scope, session_key) DO UPDATE SET "
+                            "entry_json=excluded.entry_json, updated_at=excluded.updated_at",
+                            (scope, thread_id, data, time.time()),
+                        )
+                return (target or owner) == own_id
+
+            if claim:
+                return db._execute_write(resolve)
+            # No mutation during missed-message eligibility checks.
+            with db._read_ctx() as conn:
+                return resolve(conn)
+        except Exception:
+            logger.exception("[%s] Cannot resolve durable owner for Discord Thread %s", self.name, thread_id)
+            return False
+
     def _in_bot_thread(self, message: Any) -> bool:
         """Thread the bot already joined skips the mention check — unless
         thread_require_mention (multi-bot threads) gates threads like channels."""
+        if self._discord_thread_owner_routing() and isinstance(message.channel, discord.Thread):
+            return self._route_owned_thread(message)
         return (
             isinstance(message.channel, discord.Thread)
             and str(message.channel.id) in self._threads
@@ -2200,6 +2285,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return False
         admitted, role_authorized = self._discord_message_admission(message, claim=False)
         if not admitted:
+            return False
+        if (self._discord_thread_owner_routing() and isinstance(message.channel, discord.Thread)
+                and not getattr(message.author, "bot", False)
+                and not self._route_owned_thread(message, claim=True)):
             return False
         return await self._handle_message(message, role_authorized=role_authorized, recovered=True)
 
@@ -4788,6 +4877,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except (ValueError, TypeError):
             pass  # Malformed cache entry — fall back to cold-start scan
         is_thread_channel = isinstance(channel, discord.Thread)
+        team_bots = self._team_discord_bots() if is_thread_channel and self._discord_thread_owner_routing() else {}
         has_unverified = False
         try:
             def _keep(msg) -> Optional[str]:
@@ -4804,7 +4894,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     return None
                 # DISCORD_ALLOW_BOTS: for history, "mentions" counts as "all" (context, not response).
                 is_bot_author = getattr(msg.author, "bot", False)
-                if (is_bot_author and msg.author != self._client.user and not include_other_bots):
+                if (is_bot_author and msg.author != self._client.user and not include_other_bots
+                    and str(msg.author.id) not in team_bots):
                     return None
                 if not content and msg.attachments:
                     content = "(attachment)"
@@ -7012,6 +7103,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             seeded_extra[primary_key] = value
             if env_key and not os.getenv(env_key):
                 os.environ[env_key] = str(value)
+    if "thread_owner_routing" in discord_cfg:
+        seeded_extra["thread_owner_routing"] = discord_cfg["thread_owner_routing"]
     return seeded_extra or None
 
 
