@@ -4010,7 +4010,9 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(conn, task_id, "commented", {
+            "author": author, "len": len(body), "comment_id": cur.lastrowid,
+        })
         return int(cur.lastrowid or 0)
 
 
